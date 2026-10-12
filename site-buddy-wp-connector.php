@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       Site Buddy Connector
  * Description:       Lets Site Buddy copy this site (database, themes and plugins) into a private development copy. Pair it from Tools, Site Buddy.
- * Version:           0.1.3
+ * Version:           0.1.4
  * Requires at least: 5.6
  * Requires PHP:      7.4
  * Author:            Site Buddy
@@ -13,7 +13,7 @@
 
 defined('ABSPATH') || exit;
 
-define('SBWC_VERSION', '0.1.3');
+define('SBWC_VERSION', '0.1.4');
 define('SBWC_DIR', __DIR__);
 
 require_once SBWC_DIR . '/includes/class-sbwc-auth.php';
