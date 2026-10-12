@@ -106,6 +106,19 @@ final class SBWC_Export
         @ignore_user_abort(true);
         self::$job = $state['job'];
         $work = $state['work'];
+        // A host that ends PHP mid-export (memory_limit, a hard time limit) would otherwise leave "running" for hours.
+        register_shutdown_function(function () use ($work): void {
+            $error = error_get_last();
+            $current = self::current();
+            if (($current['job'] ?? null) !== self::$job || ($current['state'] ?? '') !== 'running') {
+                return;
+            }
+            self::remove_dir($work);
+            $current['state'] = 'failed';
+            $current['error'] = 'The export stopped before it finished'
+                . ($error && in_array($error['type'], [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR], true) ? ': ' . $error['message'] : '; the host probably ended it.');
+            update_option(self::OPTION, $current, false);
+        });
         try {
             $sql = $work . '/database.sql';
             $state['method'] = self::dump_database($sql, (array) ($state['exclude_data'] ?? []));
@@ -374,8 +387,13 @@ final class SBWC_Export
 
     // ------------------------------------------------------------------ archive
 
+    /**
+     * Build the archive in the private work folder and move it into place only when complete, so nothing partial is
+     * ever web-readable (0.1.2 left a 137 MB uncompressed .tar, database included, at the public URL minus ".gz").
+     */
     private static function pack(string $archive, string $dir): string
     {
+        $staged = $dir . '/site.tar.gz';
         if (self::can_exec() && ($tar = self::which('tar')) !== '') {
             $excludes = '';
             foreach (self::EXCLUDE as $name) {
@@ -384,21 +402,23 @@ final class SBWC_Export
             foreach (self::EXCLUDE_PREFIXES as $prefix) {
                 $excludes .= ' --exclude=' . escapeshellarg('./' . $prefix . '*');
             }
-            $command = escapeshellarg($tar) . ' -czf ' . escapeshellarg($archive)
+            $command = escapeshellarg($tar) . ' -czf ' . escapeshellarg($staged)
                 . ' -C ' . escapeshellarg(WP_CONTENT_DIR) . $excludes . ' --transform=' . escapeshellarg('s,^\./,wp-content/,') . ' .'
                 . ' -C ' . escapeshellarg($dir) . ' database.sql manifest.json 2>/dev/null';
             exec($command, $output, $code);
-            if ($code === 0 && is_file($archive) && filesize($archive) > 0) {
+            if ($code === 0 && is_file($staged) && filesize($staged) > 0) {
+                self::publish($staged, $archive);
+
                 return 'tar';
             }
-            @unlink($archive);
+            @unlink($staged);
         }
         if (! class_exists('PharData')) {
             throw new RuntimeException('This host can neither run tar nor build archives in PHP (PharData is missing).');
         }
         // One pass: buildFromIterator writes the archive once, where addFile per file rewrote it every time
         // (quadratic; a 7,000-file wp-content took minutes and had barely started).
-        $tarPath = substr($archive, 0, -3);
+        $tarPath = $dir . '/site.tar';
         $phar = new PharData($tarPath);
         $phar->buildFromIterator((function () use ($dir): Generator {
             foreach (self::content_files() as $absolute => $relative) {
@@ -407,11 +427,48 @@ final class SBWC_Export
             yield 'database.sql' => $dir . '/database.sql';
             yield 'manifest.json' => $dir . '/manifest.json';
         })());
-        $phar->compress(Phar::GZ);
         unset($phar);
+        self::progress(['phase' => 'compress']);
+        self::gzip($tarPath, $staged);
         @unlink($tarPath);
+        self::publish($staged, $archive);
 
         return 'phardata';
+    }
+
+    /**
+     * Compress a file a megabyte at a time. PharData::compress() reads the whole archive into memory and died at a
+     * 128 MB memory_limit on a 137 MB archive (a shared-hosting test site, 2026-10-11).
+     */
+    private static function gzip(string $from, string $to): void
+    {
+        $in = fopen($from, 'rb');
+        $out = gzopen($to, 'wb6');
+        if ($in === false || $out === false) {
+            throw new RuntimeException('Could not compress the archive.');
+        }
+        while (! feof($in)) {
+            $chunk = fread($in, MB_IN_BYTES);
+            if ($chunk === false || ($chunk !== '' && gzwrite($out, $chunk) === false)) {
+                throw new RuntimeException('Could not compress the archive.');
+            }
+            self::progress(['phase' => 'compress', 'bytes' => ftell($in)], false);
+        }
+        fclose($in);
+        gzclose($out);
+    }
+
+    /** Move the finished archive to its public name; a copy when the work folder is on another filesystem. */
+    private static function publish(string $staged, string $archive): void
+    {
+        if (! @rename($staged, $archive)) {
+            $partial = $archive . '.' . bin2hex(random_bytes(8)) . '.part';
+            if (! @copy($staged, $partial) || ! @rename($partial, $archive)) {
+                @unlink($partial);
+                throw new RuntimeException('Could not move the finished archive into place.');
+            }
+            @unlink($staged);
+        }
     }
 
     /** @return iterable<string, string> absolute path => path relative to wp-content, for every file copied */
