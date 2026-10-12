@@ -50,7 +50,7 @@ final class SBWC_Export
     public static function status(): array
     {
         $state = self::state();
-        unset($state['dir'], $state['file']);
+        unset($state['dir'], $state['file'], $state['work']);
 
         return $state;
     }
@@ -75,9 +75,11 @@ final class SBWC_Export
             'job' => $token,
             'started' => time(),
             'dir' => $dir,
+            'work' => self::work_dir($token, $dir),
             'file' => $dir . '/' . $name,
             'url' => $url . '/' . $name,
             'method' => null,
+            'progress' => ['phase' => 'starting'],
         ], false);
 
         return $token;
@@ -92,37 +94,128 @@ final class SBWC_Export
         }
         @set_time_limit(0);
         @ignore_user_abort(true);
+        self::$job = $state['job'];
+        $work = $state['work'];
         try {
-            $dir = $state['dir'];
-            $sql = $dir . '/database.sql';
+            $sql = $work . '/database.sql';
             $state['method'] = self::dump_database($sql);
-            file_put_contents($dir . '/manifest.json', wp_json_encode(SBWC_Manifest::build(), JSON_PRETTY_PRINT));
-            $state['method'] .= '+' . self::pack($state['file'], $dir);
-            @unlink($sql);
-            @unlink($dir . '/manifest.json');
+            file_put_contents($work . '/manifest.json', wp_json_encode(SBWC_Manifest::build(), JSON_PRETTY_PRINT));
+            self::progress(['phase' => 'archive']);
+            $state['method'] .= '+' . self::pack($state['file'], $work);
             clearstatcache();
-            $state['state'] = 'ready';
-            $state['bytes'] = (int) filesize($state['file']);
-            $state['sha256'] = hash_file('sha256', $state['file']);
-            $state['finished'] = time();
+            $state = array_merge(self::current(), [
+                'state' => 'ready',
+                'method' => $state['method'],
+                'bytes' => (int) filesize($state['file']),
+                'sha256' => hash_file('sha256', $state['file']),
+                'finished' => time(),
+                'progress' => ['phase' => 'done'],
+            ]);
+        } catch (SBWC_Cancelled $e) {
+            self::remove_dir($work);
+
+            return;
         } catch (Throwable $e) {
-            $state['state'] = 'failed';
-            $state['error'] = $e->getMessage();
+            $state = array_merge(self::current() ?: $state, ['state' => 'failed', 'error' => $e->getMessage()]);
         }
+        self::remove_dir($work);
+        if ((self::current()['job'] ?? null) === self::$job) {
+            update_option(self::OPTION, $state, false);
+        }
+    }
+
+    /** @var string|null the job this process is running, so a newer export or a clean-up can stop it */
+    private static $job = null;
+
+    private static $last_progress = 0.0;
+
+    private static function current(): array
+    {
+        wp_cache_delete(self::OPTION, 'options');
+        wp_cache_delete('alloptions', 'options');
+        $state = get_option(self::OPTION);
+
+        return is_array($state) ? $state : [];
+    }
+
+    /**
+     * Record progress (at most every two seconds), and stop if this export was cancelled or replaced: the panel
+     * removing the archive, or starting another, is how a running export is stopped.
+     */
+    private static function progress(array $progress, bool $force = true): void
+    {
+        if (! $force && microtime(true) - self::$last_progress < 2) {
+            return;
+        }
+        self::$last_progress = microtime(true);
+        $state = self::current();
+        if (($state['job'] ?? null) !== self::$job) {
+            throw new SBWC_Cancelled();
+        }
+        $state['progress'] = $progress;
         update_option(self::OPTION, $state, false);
     }
 
-    /** Remove the archive and its folder. */
+    /**
+     * Where the dump and manifest are written while the archive is built: outside the web root when the system's
+     * temp folder is usable and has room, so a half-written dump can never be fetched over the web. Otherwise a
+     * subfolder of the export folder, with a random name and a deny rule (honoured by Apache and LiteSpeed).
+     */
+    private static function work_dir(string $token, string $exportDir): string
+    {
+        global $wpdb;
+        $needed = (int) $wpdb->get_var($wpdb->prepare(
+            'SELECT SUM(data_length) FROM information_schema.TABLES WHERE table_schema = %s AND table_name LIKE %s',
+            DB_NAME,
+            $wpdb->esc_like($wpdb->prefix) . '%'
+        )) * 2 + 50 * MB_IN_BYTES;
+        foreach ([defined('WP_TEMP_DIR') ? WP_TEMP_DIR : '', sys_get_temp_dir(), (string) ini_get('upload_tmp_dir')] as $base) {
+            $base = rtrim((string) $base, '/');
+            if ($base === '' || strpos(wp_normalize_path($base) . '/', wp_normalize_path(ABSPATH)) === 0 || ! @is_writable($base)) {
+                continue;
+            }
+            $free = function_exists('disk_free_space') ? @disk_free_space($base) : false;
+            if ($free !== false && $free < $needed) {
+                continue;
+            }
+            $dir = $base . '/sbwc-' . $token;
+            if (wp_mkdir_p($dir)) {
+                @chmod($dir, 0700);
+
+                return $dir;
+            }
+        }
+        $dir = $exportDir . '/work-' . bin2hex(random_bytes(16));
+        wp_mkdir_p($dir);
+        file_put_contents($dir . '/.htaccess', "Require all denied\nDeny from all\n");
+        file_put_contents($dir . '/index.html', '');
+
+        return $dir;
+    }
+
+    private static function remove_dir(string $dir): void
+    {
+        if ($dir === '' || ! is_dir($dir)) {
+            return;
+        }
+        foreach (glob(rtrim($dir, '/') . '/{,.}*', GLOB_BRACE) ?: [] as $file) {
+            if (is_file($file)) {
+                @unlink($file);
+            }
+        }
+        @rmdir($dir);
+    }
+
+    /** Remove the archive, its folder and the work folder. A running export notices and stops. */
     public static function cleanup(): void
     {
         $state = get_option(self::OPTION);
-        if (is_array($state) && ! empty($state['dir']) && is_dir($state['dir'])) {
-            foreach (glob(rtrim($state['dir'], '/') . '/{,.}*', GLOB_BRACE) ?: [] as $file) {
-                if (is_file($file)) {
-                    @unlink($file);
-                }
+        if (is_array($state)) {
+            self::remove_dir((string) ($state['work'] ?? ''));
+            foreach (glob(rtrim((string) ($state['dir'] ?? ''), '/') . '/work-*', GLOB_ONLYDIR) ?: [] as $work) {
+                self::remove_dir($work);
             }
-            @rmdir($state['dir']);
+            self::remove_dir((string) ($state['dir'] ?? ''));
         }
         delete_option(self::OPTION);
     }
@@ -139,6 +232,7 @@ final class SBWC_Export
 
     private static function dump_database(string $sql): string
     {
+        self::progress(['phase' => 'database']);
         if (self::can_exec() && ($mysqldump = self::which('mysqldump')) !== '' && self::mysqldump($mysqldump, $sql)) {
             return 'mysqldump';
         }
@@ -175,33 +269,72 @@ final class SBWC_Export
         return $code === 0 && is_file($sql) && filesize($sql) > 0;
     }
 
-    /** A table-by-table dump in plain PHP, in batches so memory stays flat. */
+    /**
+     * A table-by-table dump in plain PHP. Each table is read with ONE unbuffered query (MYSQLI_USE_RESULT): rows
+     * stream as they are read, so memory stays flat and a large table is one pass. Paging with LIMIT/OFFSET re-scans
+     * every earlier row per page and slowed to ~60 KB/s on a 934 MB database (a shared-hosting test site, 2026-10-11).
+     * The stream uses a connection of its own, since an open unbuffered result blocks its connection and progress
+     * is written through WordPress's.
+     */
     private static function php_dump(string $sql): void
     {
         global $wpdb;
+        $tables = $wpdb->get_col($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($wpdb->prefix) . '%'));
+        $db = self::connect();
         $out = fopen($sql, 'wb');
         if ($out === false) {
             throw new RuntimeException('Could not write the database dump.');
         }
-        fwrite($out, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\n");
-        $tables = $wpdb->get_col($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($wpdb->prefix) . '%'));
-        foreach ($tables as $table) {
-            $create = $wpdb->get_row('SHOW CREATE TABLE `' . str_replace('`', '``', $table) . '`', ARRAY_N);
-            fwrite($out, "\nDROP TABLE IF EXISTS `{$table}`;\n" . $create[1] . ";\n");
-            for ($offset = 0; ; $offset += self::ROWS_PER_SELECT) {
-                $rows = $wpdb->get_results('SELECT * FROM `' . str_replace('`', '``', $table) . '` LIMIT ' . self::ROWS_PER_SELECT . ' OFFSET ' . $offset, ARRAY_N);
-                if (! $rows) {
-                    break;
-                }
-                $values = [];
-                foreach ($rows as $row) {
-                    $values[] = '(' . implode(',', array_map(fn ($v) => $v === null ? 'NULL' : "'" . $wpdb->_real_escape($v) . "'", $row)) . ')';
-                }
-                fwrite($out, 'INSERT INTO `' . $table . '` VALUES ' . implode(",\n", $values) . ";\n");
+        fwrite($out, "SET NAMES utf8mb4;\nSET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\n");
+        $written = 0;
+        foreach ($tables as $index => $table) {
+            $quoted = '`' . str_replace('`', '``', $table) . '`';
+            $create = $db->query('SHOW CREATE TABLE ' . $quoted)->fetch_row();
+            fwrite($out, "\nDROP TABLE IF EXISTS {$quoted};\n" . $create[1] . ";\n");
+            $result = $db->query('SELECT * FROM ' . $quoted, MYSQLI_USE_RESULT);
+            if ($result === false) {
+                throw new RuntimeException('Could not read table ' . $table . ': ' . $db->error);
             }
+            $rows = 0;
+            $batch = [];
+            $batchBytes = 0;
+            while (($row = $result->fetch_row()) !== null) {
+                $values = [];
+                foreach ($row as $value) {
+                    $values[] = $value === null ? 'NULL' : "'" . $db->real_escape_string($value) . "'";
+                }
+                $line = '(' . implode(',', $values) . ')';
+                $batch[] = $line;
+                $batchBytes += strlen($line);
+                $rows++;
+                if (count($batch) >= 1000 || $batchBytes > MB_IN_BYTES) {
+                    $written += fwrite($out, 'INSERT INTO ' . $quoted . ' VALUES ' . implode(",\n", $batch) . ";\n");
+                    $batch = [];
+                    $batchBytes = 0;
+                    self::progress(['phase' => 'database', 'table' => $table, 'table_index' => $index + 1, 'tables' => count($tables), 'rows' => $rows, 'bytes' => $written], false);
+                }
+            }
+            $result->free();
+            if ($batch) {
+                $written += fwrite($out, 'INSERT INTO ' . $quoted . ' VALUES ' . implode(",\n", $batch) . ";\n");
+            }
+            self::progress(['phase' => 'database', 'table' => $table, 'table_index' => $index + 1, 'tables' => count($tables), 'rows' => $rows, 'bytes' => $written]);
         }
-        fwrite($out, "SET FOREIGN_KEY_CHECKS=1;\n");
+        fwrite($out, "SET UNIQUE_CHECKS=1;\nSET FOREIGN_KEY_CHECKS=1;\n");
         fclose($out);
+        $db->close();
+    }
+
+    private static function connect(): mysqli
+    {
+        [$host, $port, $socket] = self::db_host();
+        $db = mysqli_init();
+        if (! @$db->real_connect($host, DB_USER, DB_PASSWORD, DB_NAME, $port !== '' ? (int) $port : null, $socket !== '' ? $socket : null)) {
+            throw new RuntimeException('Could not open a second database connection for the dump.');
+        }
+        $db->set_charset('utf8mb4');
+
+        return $db;
     }
 
     /** @return array{0: string, 1: string, 2: string} host, port, socket from DB_HOST */
@@ -333,4 +466,9 @@ final class SBWC_Export
 
         return '';
     }
+}
+
+/** Thrown inside a running export when the panel removed it or started another. */
+final class SBWC_Cancelled extends RuntimeException
+{
 }

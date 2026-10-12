@@ -33,6 +33,7 @@ final class SBWC_Manifest
                 'database_bytes' => self::database_bytes(),
                 'wp_content_bytes_without_media' => SBWC_Export::content_bytes(),
             ],
+            'largest_tables' => self::largest_tables(),
             'host' => [
                 'exec' => SBWC_Export::can_exec(),
                 'mysqldump' => SBWC_Export::can_exec() && SBWC_Export::which('mysqldump') !== '',
@@ -43,6 +44,18 @@ final class SBWC_Manifest
                 'disk_free_bytes' => function_exists('disk_free_space') ? (int) @disk_free_space(WP_CONTENT_DIR) : null,
             ],
         ];
+    }
+
+    /** The biggest tables, so an unexpectedly large database (log or entry tables) is visible before copying. */
+    private static function largest_tables(): array
+    {
+        global $wpdb;
+
+        return array_map(fn ($row) => ['table' => $row->name, 'bytes' => (int) $row->bytes, 'rows' => (int) $row->row_count], (array) $wpdb->get_results($wpdb->prepare(
+            'SELECT table_name AS name, data_length + index_length AS bytes, table_rows AS row_count FROM information_schema.TABLES WHERE table_schema = %s AND table_name LIKE %s ORDER BY bytes DESC LIMIT 8',
+            DB_NAME,
+            $wpdb->esc_like($wpdb->prefix) . '%'
+        )));
     }
 
     private static function database_bytes(): int
