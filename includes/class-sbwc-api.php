@@ -71,7 +71,8 @@ final class SBWC_Api
         }
         if ($route === 'export' && $method === 'POST') {
             try {
-                $job = SBWC_Export::begin();
+                $options = json_decode($body, true);
+                $job = SBWC_Export::begin(is_array($options) ? (array) ($options['exclude_data'] ?? []) : []);
             } catch (Throwable $e) {
                 self::send(500, ['error' => $e->getMessage()]);
             }

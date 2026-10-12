@@ -14,7 +14,7 @@ newer than five minutes are refused.
 | Route | Method | What it does |
 | --- | --- | --- |
 | `manifest` | GET | WordPress/PHP versions, table prefix, theme, plugins, sizes, what the host allows |
-| `export` | POST | Start building the archive (answers 202 at once, keeps working) |
+| `export` | POST | Start building the archive (answers 202 at once, keeps working). Body `{"exclude_data": [tables]}` keeps those tables' structure but leaves out their rows (form submissions, logs) |
 | `export` | GET | Status: running, ready (with `url`, `bytes`, `sha256`) or failed |
 | `export` | DELETE | Remove the archive |
 

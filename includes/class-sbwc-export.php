@@ -55,10 +55,19 @@ final class SBWC_Export
         return $state;
     }
 
-    /** Prepare a new export and record it as running. Returns the job id. */
-    public static function begin(): string
+    /**
+     * Prepare a new export and record it as running. Returns the job id.
+     *
+     * @param  list<string>  $excludeData  tables whose rows are left out (their structure is kept), e.g. form
+     *                                     submissions holding customers' personal data; only this site's own tables
+     *                                     are accepted, anything else is ignored
+     */
+    public static function begin(array $excludeData = []): string
     {
+        global $wpdb;
         self::cleanup();
+        $tables = $wpdb->get_col($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($wpdb->prefix) . '%'));
+        $excludeData = array_values(array_intersect(array_map('strval', $excludeData), $tables));
         $uploads = wp_upload_dir(null, false);
         $token = bin2hex(random_bytes(24));
         $dir = trailingslashit($uploads['basedir']) . 'site-buddy-' . $token;
@@ -79,6 +88,7 @@ final class SBWC_Export
             'file' => $dir . '/' . $name,
             'url' => $url . '/' . $name,
             'method' => null,
+            'exclude_data' => $excludeData,
             'progress' => ['phase' => 'starting'],
         ], false);
 
@@ -98,7 +108,7 @@ final class SBWC_Export
         $work = $state['work'];
         try {
             $sql = $work . '/database.sql';
-            $state['method'] = self::dump_database($sql);
+            $state['method'] = self::dump_database($sql, (array) ($state['exclude_data'] ?? []));
             file_put_contents($work . '/manifest.json', wp_json_encode(SBWC_Manifest::build(), JSON_PRETTY_PRINT));
             self::progress(['phase' => 'archive']);
             $state['method'] .= '+' . self::pack($state['file'], $work);
@@ -230,18 +240,20 @@ final class SBWC_Export
 
     // ------------------------------------------------------------------ database
 
-    private static function dump_database(string $sql): string
+    /** @param list<string> $excludeData tables dumped as structure only */
+    private static function dump_database(string $sql, array $excludeData): string
     {
         self::progress(['phase' => 'database']);
-        if (self::can_exec() && ($mysqldump = self::which('mysqldump')) !== '' && self::mysqldump($mysqldump, $sql)) {
+        if (self::can_exec() && ($mysqldump = self::which('mysqldump')) !== '' && self::mysqldump($mysqldump, $sql, $excludeData)) {
             return 'mysqldump';
         }
-        self::php_dump($sql);
+        self::php_dump($sql, $excludeData);
 
         return 'php-dump';
     }
 
-    private static function mysqldump(string $binary, string $sql): bool
+    /** @param list<string> $excludeData */
+    private static function mysqldump(string $binary, string $sql, array $excludeData = []): bool
     {
         global $wpdb;
         [$host, $port, $socket] = self::db_host();
@@ -259,10 +271,13 @@ final class SBWC_Export
         }
         file_put_contents($defaults, implode("\n", $lines) . "\n");
         $tables = $wpdb->get_col($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($wpdb->prefix) . '%'));
-        $command = escapeshellarg($binary) . ' --defaults-extra-file=' . escapeshellarg($defaults)
-            . ' --single-transaction --quick --no-tablespaces --skip-lock-tables --default-character-set=utf8mb4 '
-            . escapeshellarg(DB_NAME) . ' ' . implode(' ', array_map('escapeshellarg', $tables))
-            . ' > ' . escapeshellarg($sql) . ' 2>/dev/null';
+        $base = escapeshellarg($binary) . ' --defaults-extra-file=' . escapeshellarg($defaults)
+            . ' --single-transaction --quick --no-tablespaces --skip-lock-tables --default-character-set=utf8mb4 ' . escapeshellarg(DB_NAME);
+        $kept = array_values(array_diff($tables, $excludeData));
+        $command = $base . ' ' . implode(' ', array_map('escapeshellarg', $kept)) . ' > ' . escapeshellarg($sql) . ' 2>/dev/null';
+        if ($excludeData) {
+            $command .= ' && ' . $base . ' --no-data ' . implode(' ', array_map('escapeshellarg', $excludeData)) . ' >> ' . escapeshellarg($sql) . ' 2>/dev/null';
+        }
         exec($command, $output, $code);
         @unlink($defaults);
 
@@ -276,7 +291,8 @@ final class SBWC_Export
      * The stream uses a connection of its own, since an open unbuffered result blocks its connection and progress
      * is written through WordPress's.
      */
-    private static function php_dump(string $sql): void
+    /** @param list<string> $excludeData tables dumped as structure only */
+    private static function php_dump(string $sql, array $excludeData = []): void
     {
         global $wpdb;
         $tables = $wpdb->get_col($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($wpdb->prefix) . '%'));
@@ -291,6 +307,11 @@ final class SBWC_Export
             $quoted = '`' . str_replace('`', '``', $table) . '`';
             $create = $db->query('SHOW CREATE TABLE ' . $quoted)->fetch_row();
             fwrite($out, "\nDROP TABLE IF EXISTS {$quoted};\n" . $create[1] . ";\n");
+            if (in_array($table, $excludeData, true)) {
+                self::progress(['phase' => 'database', 'table' => $table, 'table_index' => $index + 1, 'tables' => count($tables), 'rows' => 0, 'bytes' => $written, 'skipped' => true]);
+
+                continue;
+            }
             $result = $db->query('SELECT * FROM ' . $quoted, MYSQLI_USE_RESULT);
             if ($result === false) {
                 throw new RuntimeException('Could not read table ' . $table . ': ' . $db->error);
